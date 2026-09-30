@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
-from app.core.clock import Clock, SystemClock, to_storage
+from app.core.clock import Clock, SystemClock, from_storage, to_storage
 from app.core.errors import ConflictError, ValidationError
 from app.germplasm.repository import GermplasmRepository, record
+from app.services.idempotency import IdempotencyService
+
+
+# 无实际位移的重复移库请求只在通用幂等表中留痕，不写入业务流水
+MOVE_IDEMPOTENCY_SCOPE = "placement_move"
 
 
 class InventoryService:
@@ -13,6 +19,7 @@ class InventoryService:
         self.connection = connection
         self.clock = clock or SystemClock()
         self.repository = GermplasmRepository(connection)
+        self.idempotency = IdempotencyService(connection, self.clock)
 
     def create_location(self, data: dict[str, Any]) -> dict[str, Any]:
         timestamp = to_storage(self.clock.now())
@@ -116,10 +123,42 @@ class InventoryService:
         )
         return {"placement": self.repository.require_placement(placement_id), "replayed": False}
 
+    def _next_placed_at(self, container_code: str, timestamp: str) -> str:
+        # 存储时间为秒级精度，同一容器连续移动时需避开 UNIQUE(container_code,placed_at)
+        latest = self.connection.execute(
+            "SELECT MAX(placed_at) FROM lot_placements WHERE container_code=?", (container_code,)
+        ).fetchone()[0]
+        if latest is not None and latest >= timestamp:
+            timestamp = to_storage(from_storage(latest) + timedelta(seconds=1))
+        return timestamp
+
     def move_placement(self, placement_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        # 已生效的真实移库：按业务流水重放，并校验同一幂等键没有携带不同语义。
+        # 重放请求路径上的 placement_id 仍是移动前的旧摆放，因此只比对目标与原因，
+        # 不要求它等于流水记录的新摆放。
         previous = self.repository.movement_by_key(data["idempotency_key"])
         if previous:
-            return {"placement": self.repository.require_placement(int(previous["placement_id"])), "replayed": True}
+            if previous["movement_type"] != "移库":
+                raise ConflictError("幂等键已被其他业务操作占用")
+            if int(previous["to_location_id"]) != int(data["target_location_id"]):
+                raise ConflictError("同一幂等键对应了不同的目标库位", context={
+                    "target_location_id": previous["to_location_id"],
+                })
+            if previous["reason"] != data["reason"]:
+                raise ConflictError("同一幂等键对应了不同的移库原因", context={"reason": previous["reason"]})
+            return {
+                "placement": self.repository.require_placement(int(previous["placement_id"])),
+                "replayed": True,
+                "no_op": False,
+            }
+
+        # 已记录的无位移空操作：原样返回最初结果；同键不同请求由指纹比对明确报冲突
+        stored = self.idempotency.lookup(MOVE_IDEMPOTENCY_SCOPE, data["idempotency_key"], data)
+        if stored is not None:
+            result = dict(stored.body)
+            result["replayed"] = True
+            return result
+
         placement = self.repository.require_placement(placement_id)
         if placement["removed_at"]:
             raise ConflictError("容器已经移出原库位")
@@ -128,10 +167,26 @@ class InventoryService:
         target = self.repository.require_location(int(data["target_location_id"]))
         if target["status"] != "active":
             raise ConflictError("目标库位当前不可用")
+
+        # 重复选择原库位视为无实际位移：稳定幂等成功，不新增摆放/流水，不推进版本
+        if int(target["id"]) == int(placement["location_id"]):
+            result = {
+                "placement": self.repository.require_placement(placement_id),
+                "replayed": False,
+                "no_op": True,
+                "message": "目标库位与原库位相同，容器无需移动",
+            }
+            saved = self.idempotency.save(MOVE_IDEMPOTENCY_SCOPE, data["idempotency_key"], data, result, 200)
+            result["replayed"] = saved.replayed
+            return result
+
+        # 真正跨库位：容量按目标库位当前占用校验（源容器在源库位，不计入目标占用）
         used = self.repository.location_usage(int(target["id"]))
         if used + float(placement["weight_grams"]) > float(target["capacity_grams"]) + 1e-9:
             raise ConflictError("目标库位容量不足", context={"available_grams": target["capacity_grams"] - used})
-        timestamp = to_storage(self.clock.now())
+        timestamp = self._next_placed_at(
+            placement["container_code"], to_storage(self.clock.now())
+        )
         cursor = self.connection.execute(
             "INSERT INTO lot_placements(lot_id,location_id,weight_grams,container_code,placed_at) VALUES(?,?,?,?,?)",
             (placement["lot_id"], target["id"], placement["weight_grams"], placement["container_code"], timestamp),
@@ -151,7 +206,7 @@ class InventoryService:
                 data["idempotency_key"], data["actor"], data["reason"], timestamp,
             ),
         )
-        return {"placement": self.repository.require_placement(new_id), "replayed": False}
+        return {"placement": self.repository.require_placement(new_id), "replayed": False, "no_op": False}
 
     def withdraw(self, data: dict[str, Any]) -> dict[str, Any]:
         previous = self.repository.movement_by_key(data["idempotency_key"])
