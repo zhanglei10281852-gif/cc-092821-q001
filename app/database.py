@@ -233,6 +233,21 @@ CREATE TABLE IF NOT EXISTS lot_movements (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_movements_lot ON lot_movements(lot_id,id);
+CREATE TABLE IF NOT EXISTS movement_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    placement_id INTEGER NOT NULL REFERENCES lot_placements(id),
+    from_location_id INTEGER NOT NULL REFERENCES storage_locations(id),
+    to_location_id INTEGER NOT NULL REFERENCES storage_locations(id),
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('moved','no_move')),
+    result_placement_id INTEGER NOT NULL REFERENCES lot_placements(id),
+    result_movement_id INTEGER REFERENCES lot_movements(id),
+    request_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_movement_requests_placement ON movement_requests(placement_id,id);
 CREATE TABLE IF NOT EXISTS lot_holds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,

@@ -125,6 +125,10 @@ class GermplasmRepository:
         item["movements"] = records(self.connection.execute(
             "SELECT * FROM lot_movements WHERE lot_id=? ORDER BY id", (lot_id,)
         ).fetchall())
+        item["move_requests"] = records(self.connection.execute(
+            "SELECT r.* FROM movement_requests r JOIN lot_placements p ON p.id=r.placement_id "
+            "WHERE p.lot_id=? ORDER BY r.id", (lot_id,)
+        ).fetchall())
         item["holds"] = records(self.connection.execute(
             "SELECT * FROM lot_holds WHERE lot_id=? ORDER BY id", (lot_id,)
         ).fetchall())
@@ -142,6 +146,9 @@ class GermplasmRepository:
 
     def movement_by_key(self, key: str) -> dict[str, Any] | None:
         return record(self.connection.execute("SELECT * FROM lot_movements WHERE idempotency_key=?", (key,)).fetchone())
+
+    def move_request_by_key(self, key: str) -> dict[str, Any] | None:
+        return record(self.connection.execute("SELECT * FROM movement_requests WHERE idempotency_key=?", (key,)).fetchone())
 
     def require_protocol(self, protocol_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM viability_protocols WHERE id=?", (protocol_id,)).fetchone())

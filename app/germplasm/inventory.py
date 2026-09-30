@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import timedelta
 from typing import Any
 
-from app.core.clock import Clock, SystemClock, to_storage
+from app.core.clock import Clock, SystemClock, from_storage, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.core.security import request_fingerprint
 from app.germplasm.repository import GermplasmRepository, record
 
 
@@ -81,6 +83,8 @@ class InventoryService:
         if previous:
             placement = self.repository.require_placement(int(previous["placement_id"]))
             return {"placement": placement, "replayed": True}
+        if self.repository.move_request_by_key(data["idempotency_key"]):
+            raise ConflictError("同一幂等键已经用于其他库存业务")
         lot = self.repository.require_lot(int(data["lot_id"]))
         location = self.repository.require_location(int(data["location_id"]))
         if lot["status"] in {"depleted", "disposed"}:
@@ -117,46 +121,126 @@ class InventoryService:
         return {"placement": self.repository.require_placement(placement_id), "replayed": False}
 
     def move_placement(self, placement_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        previous = self.repository.movement_by_key(data["idempotency_key"])
-        if previous:
-            return {"placement": self.repository.require_placement(int(previous["placement_id"])), "replayed": True}
+        key = data["idempotency_key"]
+        target_location_id = int(data["target_location_id"])
+        reason = data["reason"]
+        fingerprint = request_fingerprint({
+            "placement_id": placement_id,
+            "target_location_id": target_location_id,
+            "reason": reason,
+        })
+
+        previous = self.repository.move_request_by_key(key)
+        if previous is not None:
+            if previous["request_hash"] != fingerprint:
+                raise ConflictError(
+                    "同一幂等键已经用于其他移库请求，目标库位或原因不一致",
+                    context={
+                        "placement_id": previous["placement_id"],
+                        "target_location_id": previous["to_location_id"],
+                        "reason": previous["reason"],
+                    },
+                )
+            return {
+                "placement": self.repository.require_placement(int(previous["result_placement_id"])),
+                "replayed": True,
+                "moved": previous["outcome"] == "moved",
+            }
+
+        # 兼容改造前仅登记在 lot_movements 的移库流水：直接重放原结果；
+        # 若该键已被其他库存业务占用，则明确报冲突。
+        legacy = self.repository.movement_by_key(key)
+        if legacy is not None:
+            if legacy["movement_type"] != "移库":
+                raise ConflictError("同一幂等键已经用于其他库存业务")
+            return {
+                "placement": self.repository.require_placement(int(legacy["placement_id"])),
+                "replayed": True,
+                "moved": True,
+            }
+
         placement = self.repository.require_placement(placement_id)
         if placement["removed_at"]:
             raise ConflictError("容器已经移出原库位")
         if int(placement["version"]) != int(data["expected_version"]):
             raise ConflictError("容器摆放版本冲突", context={"current_version": placement["version"]})
-        target = self.repository.require_location(int(data["target_location_id"]))
+
+        timestamp = to_storage(self.clock.now())
+        # lot_placements 对 (container_code, placed_at) 有唯一约束，移库新记录的
+        # 入库时间必须严格晚于原摆放记录，避免同一秒内移动造成键冲突。
+        if timestamp <= placement["placed_at"]:
+            timestamp = to_storage(from_storage(placement["placed_at"]) + timedelta(seconds=1))
+
+        # 扫描枪重复扫到原库位：没有实际位移，不新增摆放/流水、不推进版本，
+        # 仅以幂等键登记一次“无位移”结果，后续重放稳定返回同一条记录。
+        if int(placement["location_id"]) == target_location_id:
+            try:
+                self.connection.execute(
+                    "INSERT INTO movement_requests(idempotency_key,placement_id,from_location_id,to_location_id,reason,"
+                    "actor,outcome,result_placement_id,result_movement_id,request_hash,created_at) "
+                    "VALUES(?,?,?,?,?,?, 'no_move', ?,NULL,?,?)",
+                    (
+                        key, placement["id"], placement["location_id"], placement["location_id"], reason,
+                        data["actor"], placement["id"], fingerprint, timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 延迟事务并发下另一个携带相同幂等键的请求可能抢先提交。
+                # 这里主动失败、由外层事务回滚；调用方用新事务重试即可重放原结果。
+                raise ConflictError("移库请求与并发的相同幂等键冲突，请重试以获取原结果") from None
+            return {"placement": self.repository.require_placement(placement_id), "replayed": False, "moved": False}
+
+        target = self.repository.require_location(target_location_id)
         if target["status"] != "active":
             raise ConflictError("目标库位当前不可用")
-        used = self.repository.location_usage(int(target["id"]))
+        # 容器当前不在目标库位（同库位情形已在上方短路），容量按目标现有占用加容器重量计算。
+        used = self.repository.location_usage(target_location_id)
         if used + float(placement["weight_grams"]) > float(target["capacity_grams"]) + 1e-9:
             raise ConflictError("目标库位容量不足", context={"available_grams": target["capacity_grams"] - used})
-        timestamp = to_storage(self.clock.now())
-        cursor = self.connection.execute(
-            "INSERT INTO lot_placements(lot_id,location_id,weight_grams,container_code,placed_at) VALUES(?,?,?,?,?)",
-            (placement["lot_id"], target["id"], placement["weight_grams"], placement["container_code"], timestamp),
-        )
-        new_id = int(cursor.lastrowid)
+
+        # 先做带版本谓词的条件更新：并发下只有一个请求能推进源记录版本，
+        # 其余请求在此以业务冲突失败，不会留下半成品的新摆放行。
         updated = self.connection.execute(
             "UPDATE lot_placements SET removed_at=?,version=version+1 WHERE id=? AND version=? AND removed_at IS NULL",
             (timestamp, placement_id, data["expected_version"]),
         )
         if updated.rowcount != 1:
-            raise ConflictError("容器摆放版本冲突")
-        self.connection.execute(
-            "INSERT INTO lot_movements(lot_id,placement_id,movement_type,quantity_grams,from_location_id,to_location_id,"
-            "idempotency_key,actor,reason,created_at) VALUES(?,?,'移库',?,?,?,?,?,?,?)",
-            (
-                placement["lot_id"], new_id, placement["weight_grams"], placement["location_id"], target["id"],
-                data["idempotency_key"], data["actor"], data["reason"], timestamp,
-            ),
+            raise ConflictError("容器摆放版本冲突", context={"current_version": placement["version"]})
+        cursor = self.connection.execute(
+            "INSERT INTO lot_placements(lot_id,location_id,weight_grams,container_code,placed_at) VALUES(?,?,?,?,?)",
+            (placement["lot_id"], target["id"], placement["weight_grams"], placement["container_code"], timestamp),
         )
-        return {"placement": self.repository.require_placement(new_id), "replayed": False}
+        new_id = int(cursor.lastrowid)
+        try:
+            movement_cursor = self.connection.execute(
+                "INSERT INTO lot_movements(lot_id,placement_id,movement_type,quantity_grams,from_location_id,to_location_id,"
+                "idempotency_key,actor,reason,created_at) VALUES(?,?,'移库',?,?,?,?,?,?,?)",
+                (
+                    placement["lot_id"], new_id, placement["weight_grams"], placement["location_id"], target["id"],
+                    key, data["actor"], reason, timestamp,
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO movement_requests(idempotency_key,placement_id,from_location_id,to_location_id,reason,"
+                "actor,outcome,result_placement_id,result_movement_id,request_hash,created_at) "
+                "VALUES(?,?,?,?,?,?,'moved',?,?,?,?)",
+                (
+                    key, placement_id, placement["location_id"], target_location_id, reason, data["actor"],
+                    new_id, int(movement_cursor.lastrowid), fingerprint, timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # 相同幂等键已被其他业务或并发移库占用。主动失败让外层事务整体回滚，
+            # 保证不会留下重复摆放/流水；调用方以新事务重试即可命中开头的重放分支。
+            raise ConflictError("移库请求与已存在的幂等键冲突，请重试以获取原结果") from None
+        return {"placement": self.repository.require_placement(new_id), "replayed": False, "moved": True}
 
     def withdraw(self, data: dict[str, Any]) -> dict[str, Any]:
         previous = self.repository.movement_by_key(data["idempotency_key"])
         if previous:
             return {"lot": self.repository.lot_detail(int(previous["lot_id"])), "movement": previous, "replayed": True}
+        if self.repository.move_request_by_key(data["idempotency_key"]):
+            raise ConflictError("同一幂等键已经用于其他库存业务")
         lot = self.repository.require_lot(int(data["lot_id"]))
         holds = self.repository.active_holds(int(lot["id"]))
         if holds:
